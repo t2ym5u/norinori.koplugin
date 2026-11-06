@@ -17,16 +17,17 @@ local Solver = {}
 local UNKNOWN, SHADED, EMPTY = 0, 1, 2
 Solver.UNKNOWN, Solver.SHADED, Solver.EMPTY = UNKNOWN, SHADED, EMPTY
 
--- Difficulty is the hardest technique the logical solver needs:
+-- The logical solver has two levels of technique:
 --   1 = counting and domino rules (a region with two shaded cells is full, a
 --       lone shaded cell with one open neighbour extends into it, ...), plus
 --       case analysis on a region with at most three ways left to finish --
 --       a glance more than an analysis;
 --   2 = region case analysis on any region: try every way it can still take
---       its shaded cells, keep what all the surviving ways agree on;
---   3 = single-cell trial: "if this cell were shaded, the level-1 rules
---       would break", one step deep.
--- Anything that needs more than that is never handed out as a puzzle.
+--       its shaded cells, keep what all the surviving ways agree on.
+-- There is no trial level ("assume this cell, find a contradiction"): that
+-- is guessing, and no puzzle may need it. Easy needs level 1 only; medium
+-- needs a few level-2 deductions, hard several times more (see
+-- MEDIUM_MAX_T2 / HARD_MIN_T2). LEVEL is the rank the generator aims at.
 Solver.LEVEL = { easy = 1, medium = 2, hard = 3 }
 
 local function shuffle(t)
@@ -81,7 +82,8 @@ function Solver.newPuzzle(n, region)
     for i = 1, n * n do inq[i] = false end
     return { n = n, N = n * n, region = region, cells = cells,
              nregions = nregions, nb = neighbours(n),
-             queue = {}, inq = inq, rdirty = {}, wbuf = {} }
+             queue = {}, inq = inq, rdirty = {}, wbuf = {}, unk = {},
+             log = {}, nlog = 0, logon = false, acell = {}, aval = {} }
 end
 
 -- ---------------------------------------------------------------------------
@@ -94,7 +96,7 @@ end
 -- most once, so N slots are enough): this is the counter's inner loop, and
 -- fresh tables per call used to be most of its cost. A region is re-counted
 -- only when a cell of it changed since its last count (`rdirty`).
-local function propagate(P, st, seeds)
+local function propagate(P, st, seeds, nseeds)
     local nb, cells, region, N = P.nb, P.cells, P.region, P.N
     -- Worklist of cells whose surroundings changed: a cell's rules read only
     -- its own neighbours and its region, so a change at x re-examines x, its
@@ -103,7 +105,7 @@ local function propagate(P, st, seeds)
     local head, tail, size = 1, 0, 0
     for id = 1, P.nregions do rdirty[id] = true end
     if seeds then
-        for k = 1, #seeds do
+        for k = 1, nseeds or #seeds do
             local i = seeds[k]
             if not inq[i] then inq[i] = true; tail = tail + 1; queue[tail] = i; size = size + 1 end
             local ni = nb[i]
@@ -120,6 +122,9 @@ local function propagate(P, st, seeds)
     -- Cells written while examining one cell go to `wbuf`; they and their
     -- neighbours are queued once that cell is done.
     local wbuf, nw = P.wbuf, 0
+    -- With P.logon, every cell written is also listed in P.log (P.nlog of
+    -- them), so the caller can undo the call (see regionStep).
+    local log, nlog = P.logon and P.log, 0
     while size > 0 do
         local i = queue[head]
         head = head % N + 1
@@ -188,6 +193,7 @@ local function propagate(P, st, seeds)
 
         for w = 1, nw do
             local x = wbuf[w]
+            if log then nlog = nlog + 1; log[nlog] = x end
             if not inq[x] then
                 inq[x] = true; tail = tail % N + 1; queue[tail] = x; size = size + 1
             end
@@ -200,6 +206,11 @@ local function propagate(P, st, seeds)
             end
         end
         nw = 0
+    end
+    -- A contradiction can stop with writes not yet queued.
+    if log then
+        for w = 1, nw do nlog = nlog + 1; log[nlog] = wbuf[w] end
+        P.nlog = nlog
     end
     -- Leave the scratch clean for the next call (a contradiction can stop
     -- with cells still queued).
@@ -228,60 +239,91 @@ end
 -- so each case only needs to propagate from the cells it wrote.
 -- ---------------------------------------------------------------------------
 
-local function regionStep(P, st, max_ways)
-    local N = P.N
+-- One case, played on st itself and undone after: the region's unknowns
+-- `unk` (1..nu) emptied but for a (and b), shaded, then propagated. The
+-- cells the case decides are compared with `agree` (P.acell / P.aval, na of
+-- them: what every surviving case so far agrees on, UNKNOWN where they
+-- differ), or start it if na is nil (no case survived yet). Returns na and
+-- left (how many agreed cells are not UNKNOWN). A plain function rather than
+-- a closure per region: LuaJIT ties compiled code to a closure's identity,
+-- so closures made per call keep it compiling.
+local function tryCase(P, st, unk, nu, a, b, na, left)
+    for k = 1, nu do st[unk[k]] = EMPTY end
+    st[a] = SHADED
+    if b then st[b] = SHADED end
+    P.logon = true
+    local ok = propagate(P, st, unk, nu)
+    P.logon = false
+    local log, nlog = P.log, P.nlog
+    if ok then
+        local acell, aval = P.acell, P.aval
+        if not na then
+            na = 0
+            for k = 1, nu do
+                local x = unk[k]
+                na = na + 1; acell[na] = x; aval[na] = st[x]
+            end
+            for k = 1, nlog do
+                local x = log[k]
+                na = na + 1; acell[na] = x; aval[na] = st[x]
+            end
+            left = na
+        else
+            for k = 1, na do
+                local v = aval[k]
+                if v ~= UNKNOWN and st[acell[k]] ~= v then
+                    aval[k] = UNKNOWN
+                    left = left - 1
+                end
+            end
+        end
+    end
+    for k = 1, nlog do st[log[k]] = UNKNOWN end
+    for k = 1, nu do st[unk[k]] = UNKNOWN end
+    return na, left
+end
+
+local function regionStep(P, st, max_ways, min_ways)
+    -- unk: the region's unknown cells, in P's scratch (cases only read it).
+    local unk = P.unk
     for id = 1, P.nregions do
         local list = P.cells[id]
-        local s, unk = 0, {}
+        local s, nu = 0, 0
         for k = 1, #list do
             local v = st[list[k]]
-            if v == SHADED then s = s + 1 elseif v == UNKNOWN then unk[#unk + 1] = list[k] end
+            if v == SHADED then s = s + 1 elseif v == UNKNOWN then nu = nu + 1; unk[nu] = list[k] end
         end
         local need = 2 - s
-        local ways = need == 1 and #unk or #unk * (#unk - 1) / 2
-        if need > 0 and #unk > need and ways <= max_ways then
-            -- agree: the first surviving case, then the cells every later
-            -- one agrees with (the rest reset to UNKNOWN). Once nothing is
-            -- left to agree on, the region can only fail to progress.
-            local agree, left = nil, 0
-            local function try(a, b)
-                if agree and left == 0 then return end
-                local t = copy(st)
-                for k = 1, #unk do t[unk[k]] = EMPTY end
-                t[a] = SHADED
-                if b then t[b] = SHADED end
-                if not propagate(P, t, unk) then return end
-                if not agree then
-                    agree = t
-                    for i = 1, N do
-                        if st[i] == UNKNOWN and t[i] ~= UNKNOWN then left = left + 1 end
-                    end
-                else
-                    for i = 1, N do
-                        local v = agree[i]
-                        if v ~= UNKNOWN and st[i] == UNKNOWN and t[i] ~= v then
-                            agree[i] = UNKNOWN
-                            left = left - 1
-                        end
-                    end
-                end
-            end
+        local ways = need == 1 and nu or nu * (nu - 1) / 2
+        if need > 0 and nu > need and ways <= max_ways and ways > (min_ways or 0) then
+            -- What all surviving cases agree on (see tryCase). Once nothing
+            -- is left to agree on, the region can only fail to progress.
+            local na, left = nil, 0
             if need == 1 then
-                for x = 1, #unk do try(unk[x]) end
-            else
-                for x = 1, #unk - 1 do
-                    for y = x + 1, #unk do try(unk[x], unk[y]) end
+                for x = 1, nu do
+                    if na and left == 0 then break end
+                    na, left = tryCase(P, st, unk, nu, unk[x], nil, na, left)
                 end
-            end
-            if not agree then return "contra" end
-            if left > 0 then
-                local changed = {}
-                for i = 1, N do
-                    if st[i] == UNKNOWN and agree[i] ~= UNKNOWN then
-                        st[i] = agree[i]
-                        changed[#changed + 1] = i
+            else
+                for x = 1, nu - 1 do
+                    if na and left == 0 then break end
+                    for y = x + 1, nu do
+                        if na and left == 0 then break end
+                        na, left = tryCase(P, st, unk, nu, unk[x], unk[y], na, left)
                     end
                 end
+            end
+            if not na then return "contra" end
+            if left > 0 then
+                local changed, acell, aval = {}, P.acell, P.aval
+                for k = 1, na do
+                    if aval[k] ~= UNKNOWN then
+                        st[acell[k]] = aval[k]
+                        changed[#changed + 1] = acell[k]
+                    end
+                end
+                -- In cell order, as propagate's seeds always were.
+                table.sort(changed)
                 return true, changed
             end
         end
@@ -290,7 +332,7 @@ local function regionStep(P, st, max_ways)
 end
 
 -- ---------------------------------------------------------------------------
--- Level 3: single-cell trial with the level-1 closure.
+-- Level-1 closure
 -- ---------------------------------------------------------------------------
 
 -- A region with this few ways left to finish is a glance, not an analysis:
@@ -310,30 +352,15 @@ local function closure(P, st, max_ways, seeds)
     end
 end
 
--- st is a fixpoint of closure(SMALL_CASES) here, so a trial propagates from
--- the one cell it wrote.
-local function trialStep(P, st)
-    for i = 1, P.N do
-        if st[i] == UNKNOWN then
-            local t = copy(st)
-            t[i] = SHADED
-            if not closure(P, t, SMALL_CASES, { i }) then st[i] = EMPTY; return true, { i } end
-            t = copy(st)
-            t[i] = EMPTY
-            if not closure(P, t, SMALL_CASES, { i }) then st[i] = SHADED; return true, { i } end
-        end
-    end
-    return false
-end
-
 -- Solve by logic alone, cheapest technique first, going back to level 1
 -- after every deduction. Returns status ("solved" / "stuck" / "contra"), the
--- highest level that was needed, the final state, and how many deductions
--- each level above 1 made ({ [2] = .., [3] = .. }).
+-- highest level that was needed (1 or 2), the final state, and how many
+-- level-2 deductions were made ({ [2] = .. }). A max_level above 2 is the
+-- same as 2: there is no trial level.
 function Solver.logicSolve(P, max_level, st)
     st = st and copy(st) or {}
     if #st == 0 then for i = 1, P.N do st[i] = UNKNOWN end end
-    local used, steps = 1, { 0, 0, 0 }
+    local used, steps = 1, { 0, 0 }
     -- After the first pass, propagation restarts from the cells the last
     -- deduction wrote: the state was a fixpoint before them.
     local seeds
@@ -345,20 +372,13 @@ function Solver.logicSolve(P, max_level, st)
         if r == "contra" then return "contra", used, st, steps end
         local progress = r
         if not progress and max_level >= 2 then
-            r, seeds = regionStep(P, st, math.huge)
+            -- The small regions were just tried on this same state.
+            r, seeds = regionStep(P, st, math.huge, SMALL_CASES)
             if r == "contra" then return "contra", used, st, steps end
             if r then
                 progress = true
                 steps[2] = steps[2] + 1
                 if used < 2 then used = 2 end
-            end
-        end
-        if not progress and max_level >= 3 then
-            r, seeds = trialStep(P, st)
-            if r then
-                progress = true
-                steps[3] = steps[3] + 1
-                used = 3
             end
         end
         if not progress then return "stuck", used, st, steps end
@@ -371,49 +391,65 @@ end
 -- scratch. Returns count, exhausted, solutions.
 -- ---------------------------------------------------------------------------
 
+-- Depth first, the shaded branch before the empty one, with an explicit
+-- stack (no recursion, no closures: both keep LuaJIT from compiling the
+-- counter's loop).
 function Solver.countSolutions(P, limit, budget, start)
     limit  = limit or 2
     budget = budget or 20000
     local count, nodes, exhausted = 0, 0, false
     local sols = {}
-
-    local function pick(st)
-        -- The unknown cell of the region with the fewest unknowns: its
-        -- branches are the most constrained.
-        local best, best_u = nil, math.huge
-        for id = 1, P.nregions do
-            local list = P.cells[id]
-            local u, first = 0, nil
-            for k = 1, #list do
-                if st[list[k]] == UNKNOWN then
-                    u = u + 1
-                    first = first or list[k]
-                end
-            end
-            if u > 0 and u < best_u then best, best_u = first, u end
-        end
-        return best
-    end
-
-    local function dfs(st, seed)
-        if count >= limit or exhausted then return end
-        nodes = nodes + 1
-        if nodes > budget then exhausted = true; return end
-        if not propagate(P, st, seed) then return end
-        local i = pick(st)
-        if not i then
-            count = count + 1
-            sols[#sols + 1] = st
-            return
-        end
-        -- The second branch takes over st itself: nothing reads it after.
-        local a = copy(st); a[i] = SHADED; dfs(a, { i })
-        st[i] = EMPTY; dfs(st, { i })
-    end
-
+    local cells, R = P.cells, P.nregions
+    local seed1 = {}
     local st = start and copy(start) or {}
     if not start then for i = 1, P.N do st[i] = UNKNOWN end end
-    dfs(st)
+    -- stack[k]: a state still to explore, seeds[k]: the cell it was branched
+    -- on (0: none, propagate from scratch).
+    local stack, seeds, top = { st }, { 0 }, 1
+    while top > 0 do
+        st = stack[top]
+        local sd = seeds[top]
+        stack[top] = nil
+        top = top - 1
+        if count >= limit or exhausted then break end
+        nodes = nodes + 1
+        if nodes > budget then exhausted = true; break end
+        local ok
+        if sd == 0 then
+            ok = propagate(P, st)
+        else
+            seed1[1] = sd
+            ok = propagate(P, st, seed1, 1)
+        end
+        if ok then
+            -- Branch on the first unknown cell of the region with the
+            -- fewest unknowns: its branches are the most constrained.
+            local best, best_u = nil, math.huge
+            for id = 1, R do
+                local list = cells[id]
+                local u, first = 0, nil
+                for k = 1, #list do
+                    if st[list[k]] == UNKNOWN then
+                        u = u + 1
+                        first = first or list[k]
+                    end
+                end
+                if u > 0 and u < best_u then best, best_u = first, u end
+            end
+            if not best then
+                count = count + 1
+                sols[#sols + 1] = st
+            else
+                -- The empty branch takes over st itself (pushed first, so
+                -- explored second): nothing reads st after.
+                local a = copy(st)
+                a[best] = SHADED
+                st[best] = EMPTY
+                top = top + 1; stack[top] = st; seeds[top] = best
+                top = top + 1; stack[top] = a; seeds[top] = best
+            end
+        end
+    end
     return count, exhausted, sols
 end
 
@@ -459,30 +495,43 @@ end
 -- domino can sit in many places. Each step serves the free cell with the
 -- fewest possible partners first (corners and edges, then gaps), the classic
 -- greedy for dense packings, with random tie-breaks.
+-- Module-level helpers rather than closures made per call: LuaJIT ties its
+-- compiled traces to a closure's identity, so fresh closures on every call
+-- send it back to compiling (most of the generator's time went there).
+local function free(sol, nb, i, partner)
+    if sol[i] ~= 0 then return false end
+    local ni = nb[i]
+    for k = 1, #ni do
+        local j = ni[k]
+        if j ~= partner and sol[j] ~= 0 then return false end
+    end
+    return true
+end
+
+-- The free neighbours i could pair with (into `list` when given), and how
+-- many there are.
+local function partners(sol, nb, i, list)
+    if not free(sol, nb, i) then return 0 end
+    local ni, k = nb[i], 0
+    for m = 1, #ni do
+        local j = ni[m]
+        if free(sol, nb, j) and free(sol, nb, i, j) and free(sol, nb, j, i) then
+            k = k + 1
+            if list then list[k] = j end
+        end
+    end
+    return k
+end
+
 local function plantDominoes(n, nb, target)
     local N = n * n
     local sol = {}
     for i = 1, N do sol[i] = 0 end
-    local function free(i, partner)
-        if sol[i] ~= 0 then return false end
-        for _, j in ipairs(nb[i]) do
-            if j ~= partner and sol[j] ~= 0 then return false end
-        end
-        return true
-    end
-    local function partners(i)
-        local list = {}
-        if not free(i) then return list end
-        for _, j in ipairs(nb[i]) do
-            if free(j) and free(i, j) and free(j, i) then list[#list + 1] = j end
-        end
-        return list
-    end
     local placed = 0
     while placed < target do
         local best, best_k, ties = nil, math.huge, 0
         for i = 1, N do
-            local k = #partners(i)
+            local k = partners(sol, nb, i)
             if k > 0 then
                 if k < best_k then
                     best, best_k, ties = i, k, 1
@@ -493,12 +542,46 @@ local function plantDominoes(n, nb, target)
             end
         end
         if not best then break end
-        local opts = partners(best)
+        local opts = {}
+        partners(sol, nb, best, opts)
         local j = opts[math.random(#opts)]
         sol[best], sol[j] = 1, 1
         placed = placed + 1
     end
     return sol, placed
+end
+
+-- Greedy matching, always serving the proto with the fewest unmatched
+-- neighbours first (random tie-break). A perfect matching always exists
+-- -- each domino's two halves are adjacent -- and this heuristic finds a
+-- different one almost every time; when it paints itself into a corner
+-- it simply starts over.
+local function match(protos, adj)
+    local mate = {}
+    local remaining = #protos
+    while remaining > 0 do
+        local best, best_deg, ties = nil, math.huge, 0
+        for p = 1, #protos do
+            if not mate[p] then
+                local d = 0
+                for q in pairs(adj[p]) do if not mate[q] then d = d + 1 end end
+                if d < best_deg then
+                    best, best_deg, ties = p, d, 1
+                elseif d == best_deg then
+                    ties = ties + 1
+                    if math.random(ties) == 1 then best = p end
+                end
+            end
+        end
+        if best_deg == 0 then return nil end
+        local opts = {}
+        for q in pairs(adj[best]) do if not mate[q] then opts[#opts + 1] = q end end
+        table.sort(opts)
+        local q = opts[math.random(#opts)]
+        mate[best], mate[q] = q, best
+        remaining = remaining - 2
+    end
+    return mate
 end
 
 -- Grow one proto-region per shaded cell over the empty cells, then pair the
@@ -562,41 +645,9 @@ local function buildRegions(n, nb, sol)
         end
     end
 
-    -- Greedy matching, always serving the proto with the fewest unmatched
-    -- neighbours first (random tie-break). A perfect matching always exists
-    -- -- each domino's two halves are adjacent -- and this heuristic finds a
-    -- different one almost every time; when it paints itself into a corner
-    -- it simply starts over.
-    local function match()
-        local mate = {}
-        local remaining = #protos
-        while remaining > 0 do
-            local best, best_deg, ties = nil, math.huge, 0
-            for p = 1, #protos do
-                if not mate[p] then
-                    local d = 0
-                    for q in pairs(adj[p]) do if not mate[q] then d = d + 1 end end
-                    if d < best_deg then
-                        best, best_deg, ties = p, d, 1
-                    elseif d == best_deg then
-                        ties = ties + 1
-                        if math.random(ties) == 1 then best = p end
-                    end
-                end
-            end
-            if best_deg == 0 then return nil end
-            local opts = {}
-            for q in pairs(adj[best]) do if not mate[q] then opts[#opts + 1] = q end end
-            table.sort(opts)
-            local q = opts[math.random(#opts)]
-            mate[best], mate[q] = q, best
-            remaining = remaining - 2
-        end
-        return mate
-    end
     local mate
     for _ = 1, 8 do
-        mate = match()
+        mate = match(protos, adj)
         if mate then break end
     end
     if not mate then return nil end
@@ -678,25 +729,34 @@ local function planMove(n, nb, sol, region, x)
 end
 
 -- Moves the first movable cell of `cells` (tried in the given order).
--- Returns an undo function, or nil if none could move.
+-- Returns the cells moved and their old region (for undoMove), or nil if
+-- none could move.
 local function moveOneOf(n, nb, sol, region, cells)
     for _, x in ipairs(cells) do
         local group, targets = planMove(n, nb, sol, region, x)
         if group then
             local t, old = targets[math.random(#targets)], region[x]
             for _, g in ipairs(group) do region[g] = t end
-            return function()
-                for _, g in ipairs(group) do region[g] = old end
-            end
+            return group, old
         end
     end
     return nil
 end
 
-local function emptyCells(sol, extra)
+local function undoMove(region, group, old)
+    for _, g in ipairs(group) do region[g] = old end
+end
+
+-- The planted solution's empty cells, shuffled. With `alt` (a rival
+-- solution), only those it shades; with `st` instead, those still unknown.
+local function emptyCells(sol, alt, st)
     local list = {}
     for i = 1, #sol do
-        if sol[i] == 0 and (not extra or extra(i)) then list[#list + 1] = i end
+        if sol[i] == 0 then
+            local keep = true
+            if alt then keep = alt[i] == SHADED elseif st then keep = st[i] == UNKNOWN end
+            if keep then list[#list + 1] = i end
+        end
     end
     return shuffle(list)
 end
@@ -705,8 +765,8 @@ end
 -- for its duration, and every layout measured (one solution count or one
 -- grading) is a unit of work. How many units a puzzle takes is not known in
 -- advance, so the fraction reported approaches 1 without reaching it: half
--- way after PROGRESS_HALF units (10x10 averages 30-50 units, 6x6 hard ~260
--- much cheaper ones). It only reads a counter -- never the clock, never
+-- way after PROGRESS_HALF units (10x10 averages 30-50 units, a 6x6 hard a
+-- few hundred much cheaper ones). It only reads a counter -- never the clock, never
 -- math.random -- so reporting cannot change the puzzle (the Daily Challenge
 -- needs every device to build the same grid from the same seed).
 local PROGRESS_HALF = 100
@@ -759,19 +819,16 @@ local function makeUnique(n, nb, sol, region, max_moves, budget)
     if not cur then return false end
     for _ = 1, max_moves do
         if cur == 1 then return true end
-        local undo = moveOneOf(n, nb, sol, region, emptyCells(sol, function(i)
-            if alt then return alt[i] == SHADED end
-            return st[i] == UNKNOWN
-        end))
+        local group, old = moveOneOf(n, nb, sol, region, emptyCells(sol, alt, st))
         -- Every cell that would break the rival is pinned: reshape
         -- anywhere instead and let the next round look again.
-        undo = undo or moveOneOf(n, nb, sol, region, emptyCells(sol))
-        if not undo then return false end
+        if not group then group, old = moveOneOf(n, nb, sol, region, emptyCells(sol)) end
+        if not group then return false end
         local nc, nalt, nst = measure(n, region, sol, budget)
         if nc and (nc <= cur or math.random() < ACCEPT_WORSE) then
             cur, alt, st = nc, nalt, nst
         else
-            undo()
+            undoMove(region, group, old)
         end
     end
     return cur == 1
@@ -785,67 +842,91 @@ local function countOpen(st)
     return open
 end
 
--- How far the puzzle is from the wanted level, 0 = on target, nil = not
--- acceptable at all (no longer unique, or beyond the level-3 solver). Only
--- the techniques up to the wanted level are run, so the measure stays cheap:
--- for easy and medium, the cells left open when those techniques stall give
--- the climb a slope to follow. For hard, a puzzle levels 1-2 still solve is
--- closer the more cells level 1 alone leaves open: without that slope the
--- climb was a blind walk, and a 6x6 often ran out of restarts before
--- stumbling on one that needs a trial.
-local function distance(n, region, want, budget)
-    tick()
+-- How many level-2 deductions (region case analyses) a puzzle may / must
+-- take, per grid size: medium stays within [1, MEDIUM_MAX_T2], hard needs at
+-- least HARD_MIN_T2. The gap keeps the two levels apart: a hard puzzle is a
+-- medium one with several times the analysis work, never one that needs a
+-- guess.
+Solver.MEDIUM_MAX_T2 = { [6] = 2, [8] = 3, [10] = 4 }
+Solver.HARD_MIN_T2   = { [6] = 4, [8] = 6, [10] = 8 }
+
+local function t2Window(n, want)
+    if want == 1 then return 0, 0 end
+    local mmax = Solver.MEDIUM_MAX_T2[n] or math.floor(n / 2)
+    if want == 2 then return 1, mmax end
+    return Solver.HARD_MIN_T2[n] or (2 * mmax), math.huge
+end
+
+-- Does a puzzle (already proven unique) fit the wanted level? Level 1 only
+-- for easy; levels 1-2 for medium and hard, with the number of level-2
+-- deductions inside the level's window. Exported for the specs.
+function Solver.grade(n, region)
     local P = Solver.newPuzzle(n, region)
-    local status, level, st, open1
-    if want == 3 then
-        status, _, st = Solver.logicSolve(P, 1)
-        if status == "contra" then return nil end
-        open1 = countOpen(st)
-        -- Level 2 picks up where level 1 stalled: same outcome as a fresh
-        -- run, without redoing level 1.
-        status, level, st = Solver.logicSolve(P, 2, st)
-    else
-        status, level, st = Solver.logicSolve(P, want)
-    end
+    local status, level, _, steps = Solver.logicSolve(P, 2)
+    if status ~= "solved" then return nil end
+    return level, steps[2]
+end
+
+-- How far the puzzle is from the wanted level, 0 = on target, nil = not
+-- acceptable at all (contradiction, or no longer unique). Below 1: solved by
+-- logic up to level 2, with the distance to the level's window of level-2
+-- deductions; 1 and up: the techniques stall, the more cells left open the
+-- further. Only solved puzzles (d < 1) are ever handed out.
+local function distance0(n, region, want, budget)
+    local P = Solver.newPuzzle(n, region)
+    local status, level, st, steps = Solver.logicSolve(P, want == 1 and 1 or 2)
     if status == "contra" then return nil end
     if status == "solved" then
-        if want == 3 then return 1 + 1 / (1 + open1) end
-        return level == want and 0 or 1
+        local lo, hi = t2Window(n, want)
+        local t2 = steps[2]
+        if t2 < lo then return (lo - t2) / (lo + 1) end
+        if t2 > hi then return 1 - 1 / (2 + t2 - hi) end
+        return 0
     end
     -- The techniques stall: is the solution still unique at all?
     local count, exhausted = Solver.countSolutions(P, 2, budget, st)
     if count ~= 1 or exhausted then return nil end
-    if want < 3 then return 2 + countOpen(st) end
-    -- Hard: levels 1-2 stall; it must still be solvable with trials.
-    status = Solver.logicSolve(P, 3, st)
-    return status == "solved" and 0 or nil
+    return 1 + countOpen(st) / P.N
+end
+
+local function distance(n, region, want, budget, memo)
+    tick()
+    -- The climb often proposes a layout it already measured (a move undone,
+    -- then made again): the measure is a pure function of the layout.
+    local key = table.concat(region, ",")
+    local known = memo[key]
+    if known ~= nil then return known or nil end
+    local d = distance0(n, region, want, budget)
+    memo[key] = d or false
+    return d
 end
 
 -- Reshape a unique puzzle toward the wanted difficulty: random moves, kept
 -- when the puzzle stays acceptable and got no further from the target.
-local function climb(n, nb, sol, region, want, moves, budget)
-    local d = distance(n, region, want, budget)
+local function climb(n, nb, sol, region, want, moves, budget, memo)
+    local d = distance(n, region, want, budget, memo)
     for _ = 1, moves do
         if d == 0 then break end
-        local undo = moveOneOf(n, nb, sol, region, emptyCells(sol))
-        if not undo then break end
-        local nd = distance(n, region, want, budget)
-        if nd and (not d or nd <= d) then d = nd else undo() end
+        local group, old = moveOneOf(n, nb, sol, region, emptyCells(sol))
+        if not group then break end
+        local nd = distance(n, region, want, budget, memo)
+        if nd and (not d or nd <= d) then d = nd else undoMove(region, group, old) end
     end
     return d
 end
 
 local PLANT_TRIES = 4
+local HARD_MOVES_PER_N = 10
 
 local function generateBest(n, difficulty, opts)
     local want = Solver.LEVEL[difficulty] or 1
     local nb = neighbours(n)
-    -- Restarts are cheap on small grids and hard puzzles are rare there (a
-    -- 6x6 seldom needs a trial), so they get more. A cap, not a schedule:
-    -- a 6x6 hard takes 7 on average (38 at most in 100 seeds), a 10x10
-    -- under 2.
+    -- Restarts are cheap on small grids, so they get more. A cap, not a
+    -- schedule: the closest solvable puzzle found is kept if none lands in
+    -- the level's window.
     local max_attempts = opts.max_attempts or math.floor(4000 / (n * n))
     local best, best_d
+    local memo = {}
     for _ = 1, max_attempts do
         -- Best of a few plantings: the denser the dominoes, the smaller the
         -- regions and the likelier the surgery reaches uniqueness (on 10x10,
@@ -858,27 +939,26 @@ local function generateBest(n, difficulty, opts)
         end
         local region = placed >= 2 and buildRegions(n, nb, sol)
         if region and makeUnique(n, nb, sol, region, 2 * n, BUDGET) then
-            -- Hard climbs longer: with a slope to follow (see distance),
-            -- 8n moves beat both 2n (more restarts) and 16n or more (time
-            -- lost on layouts that never get there).
-            local d = climb(n, nb, sol, region, want, want == 3 and 8 * n or 10 * n, BUDGET)
-            if d and (not best or d < best_d) then
+            local d = climb(n, nb, sol, region, want, HARD_MOVES_PER_N * n, BUDGET, memo)
+            -- Only a puzzle logic solves (d < 1) is ever kept.
+            if d and d < 1 and (not best or d < best_d) then
                 best, best_d = { n = n, region = region, solution = sol }, d
             end
             if d == 0 then break end
         end
     end
     if best then
-        local status, level = Solver.logicSolve(Solver.newPuzzle(n, best.region), 3)
-        best.level, best.difficulty = status == "solved" and level or 3, difficulty
+        best.level, best.t2 = Solver.grade(n, best.region)
+        best.difficulty = difficulty
     end
     return best
 end
 
 -- Returns { n, region = flat, solution = flat 1/0, level, difficulty }, or
--- nil if every attempt failed (callers fall back). `opts.max_attempts`
--- bounds the restarts; the closest unique puzzle found is used if none hits
--- the requested level exactly. `opts.progress(fraction)`, if given, is
+-- nil if every attempt failed (callers fall back). `level` is the highest
+-- technique needed (1 or 2), `t2` the number of level-2 deductions.
+-- `opts.max_attempts` bounds the restarts; the closest logic-solvable unique
+-- puzzle found is used if none lands in the requested level's window. `opts.progress(fraction)`, if given, is
 -- called as the work goes on (see tick), and with 1 at the end. Every budget
 -- is counted in moves or search nodes, never in time: the puzzle is a pure
 -- function of the math.random sequence.

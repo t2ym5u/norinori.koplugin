@@ -222,6 +222,20 @@ describe("NorinoriBoard", function()
             assert.is_false(b2.timer:isRunning())
         end)
 
+        -- Saves from 1.0.x carry level = 3 for hard (the trial level that
+        -- no longer exists): they must still load and play.
+        it("loads a save from 1.0.x (hard, level 3)", function()
+            local b = newBoard(6, "hard", 9)
+            local data = b:serialize()
+            data.level = 3
+            local b2 = Board:new()
+            assert.is_true(b2:load(data))
+            assert.are.equal("hard", b2.difficulty)
+            assert.are.same(b.region, b2.region)
+            solve(b2, true)
+            assert.is_true(b2:isSolved())
+        end)
+
         it("rejects invalid data", function()
             local b = Board:new()
             assert.is_false(b:load(nil))

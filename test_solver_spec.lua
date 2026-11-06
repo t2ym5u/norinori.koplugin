@@ -70,7 +70,7 @@ describe("Norinori solver", function()
             for _ = 1, 25 do
                 local P = Solver.newPuzzle(4, randomRegions(4))
                 local brute = bruteSolutions(P)
-                local status, _, st = Solver.logicSolve(P, 3)
+                local status, _, st = Solver.logicSolve(P, 2)
                 if #brute == 0 then
                     assert.are_not.equal("solved", status)
                 else
@@ -99,10 +99,11 @@ describe("Norinori solver", function()
             local count, exhausted = Solver.countSolutions(P, 2, 1e6)
             assert.is_false(exhausted)
             assert.are.equal(1, count)
-            -- ...and logic alone (up to single-cell trials) finds it.
-            local status, level, st = Solver.logicSolve(P, 3)
+            -- ...and logic alone finds it: levels 1-2, never a trial.
+            local status, level, st, steps = Solver.logicSolve(P, 2)
             assert.are.equal("solved", status)
             assert.are.equal(p.level, level)
+            assert.are.equal(p.t2, steps[2])
             for i = 1, P.N do
                 assert.are.equal(p.solution[i] == 1, st[i] == Solver.SHADED)
             end
@@ -126,30 +127,56 @@ describe("Norinori solver", function()
             return p
         end
 
-        it("makes unique, logic-solvable 6x6 puzzles at the requested level", function()
-            for seed = 1, 12 do
-                for _, diff in ipairs({ "easy", "medium" }) do
-                    local p = check(6, diff, seed)
-                    assert.are.equal(Solver.LEVEL[diff], p.level)
+        -- Easy: level 1 only. Medium: 1..MEDIUM_MAX_T2 region analyses.
+        -- Hard: at least HARD_MIN_T2 of them -- more work, never a guess.
+        local function inWindow(n, diff, p)
+            if diff == "easy" then
+                assert.are.equal(1, p.level)
+                assert.are.equal(0, p.t2)
+            elseif diff == "medium" then
+                assert.are.equal(2, p.level)
+                assert.is_true(p.t2 >= 1 and p.t2 <= Solver.MEDIUM_MAX_T2[n],
+                    ("medium %dx%d t2=%d"):format(n, n, p.t2))
+            else
+                assert.are.equal(2, p.level)
+                assert.is_true(p.t2 >= Solver.HARD_MIN_T2[n],
+                    ("hard %dx%d t2=%d"):format(n, n, p.t2))
+            end
+        end
+
+        it("keeps the levels apart: hard needs more analysis than medium", function()
+            for _, n in ipairs({ 6, 8, 10 }) do
+                assert.is_true(Solver.HARD_MIN_T2[n] > Solver.MEDIUM_MAX_T2[n])
+            end
+        end)
+
+        it("makes unique, guess-free puzzles in each level's window (6x6, 8x8)", function()
+            for _, n in ipairs({ 6, 8 }) do
+                for seed = 1, 10 do
+                    for _, diff in ipairs({ "easy", "medium", "hard" }) do
+                        inWindow(n, diff, check(n, diff, seed))
+                    end
                 end
             end
         end)
 
-        it("makes hard puzzles that need a trial (8x8)", function()
+        it("makes unique, guess-free 10x10 puzzles in each level's window", function()
             for seed = 1, 4 do
-                local p = check(8, "hard", seed)
-                assert.are.equal(3, p.level)
+                for _, diff in ipairs({ "easy", "medium", "hard" }) do
+                    inWindow(10, diff, check(10, diff, seed))
+                end
             end
         end)
 
-        it("makes unique 8x8 and 10x10 puzzles", function()
-            for seed = 1, 4 do
-                assert.are.equal(1, check(8, "easy", seed).level)
-                assert.are.equal(2, check(8, "medium", seed).level)
-            end
-            for seed = 1, 2 do
-                for _, diff in ipairs({ "easy", "medium", "hard" }) do
-                    assert.are.equal(Solver.LEVEL[diff], check(10, diff, seed).level)
+        -- Generous: the Mac takes at most ~0.35 s under LuaJIT; busted's
+        -- plain Lua is a few times slower.
+        it("stays within a time bound at the largest size", function()
+            for seed = 1, 3 do
+                for _, diff in ipairs({ "easy", "hard" }) do
+                    math.randomseed(100 + seed)
+                    local t0 = os.clock()
+                    assert.is_truthy(Solver.generate(10, diff))
+                    assert.is_true(os.clock() - t0 < 5)
                 end
             end
         end)
@@ -165,7 +192,7 @@ describe("Norinori solver", function()
         -- device: the generator must depend on math.random alone (no clock,
         -- no time budget), and reporting progress must not change a thing.
         it("builds the same puzzle from the same seed, progress reported or not", function()
-            for _, diff in ipairs({ "easy", "hard" }) do
+            for _, diff in ipairs({ "easy", "medium", "hard" }) do
                 math.randomseed(77)
                 local plain = Solver.generate(8, diff)
                 math.randomseed(77)
@@ -181,6 +208,7 @@ describe("Norinori solver", function()
                     assert.are.same(plain.region, p.region)
                     assert.are.same(plain.solution, p.solution)
                     assert.are.equal(plain.level, p.level)
+                    assert.are.equal(plain.t2, p.t2)
                 end
                 -- Called as the work goes on, never backwards, ending at 1.
                 assert.is_true(calls >= 2)
