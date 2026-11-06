@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-11-05
+
+### Changed
+- Hard no longer needs a guess. Until now every Hard grid could only be
+  finished by shading a cell and seeing the rules break ("what if this cell
+  were shaded?"). Hard now takes the same reasoning as Medium (trying every
+  way a region can still take its two shaded cells and keeping what they all
+  agree on), but several times as often: Medium needs it 1 to 4 times
+  depending on the size, Hard at least 4 (6×6), 6 (8×8) or 8 (10×10) times.
+- Hard and Medium grids differ from those of 1.0.x for the same seed, so the
+  Daily Challenge may show a different Norinori grid once.
+- Faster generation: region case analysis plays each case on the grid and
+  undoes it instead of copying the grid, skips the small regions it has
+  just tried, and a layout the generator has already graded is not graded
+  again. Worst case over 50 seeds on a desktop: 10×10 ~0.35–0.45 s →
+  ~0.15–0.3 s, 8×8 Hard ~0.22 s → ~0.1 s. Same puzzles for the same seed.
+
 ## [1.0.5] - 2026-11-04
 
 ### Fixed
